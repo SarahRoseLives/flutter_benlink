@@ -1,0 +1,19 @@
+name: flutter_benlink
+description: A flutter/dart port of the Benshi protocol from benlink.
+version: 0.0.1
+homepage: https://github.com/SarahRoseLives/flutter_benlink
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+  flutter: ">=1.17.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_bluetooth_serial: ^0.4.0 # Or the version you need
+  notify_provider: ^2.0.1 # Or another state management if you prefer
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^2.0.0
