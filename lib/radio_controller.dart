@@ -1,11 +1,20 @@
+// benshi/radio_controller.dart
+
 import 'dart:async';
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart';
 import 'protocol/protocol.dart';
+import 'dart:convert';
+
+import 'audio_controller.dart';
 
 class RadioController extends ChangeNotifier {
-  final BluetoothConnection? connection;
+  final BluetoothDevice device;
+  BluetoothConnection? _commandConnection;
+
+  AudioController? _audioController;
+
   final StreamController<Message> _messageStreamController = StreamController<Message>.broadcast();
   StreamSubscription? _btStreamSubscription;
   Uint8List _rxBuffer = Uint8List(0);
@@ -16,11 +25,16 @@ class RadioController extends ChangeNotifier {
   Settings? settings;
   Position? gps;
   Channel? currentChannel;
+  Channel? channelA;
+  Channel? channelB;
   double? batteryVoltage;
   int? batteryLevelAsPercentage;
 
-  // --- UI Getters with safe defaults ---
-  bool get isReady => deviceInfo != null && status != null && settings != null;
+  // --- ADD THIS ---
+  List<TncDataFragment> aprsPackets = [];
+  // ----------------
+
+  bool get isReady => deviceInfo != null && status != null && settings != null && channelA != null && channelB != null;
   bool get isPowerOn => status?.isPowerOn ?? true;
   bool get isInTx => status?.isInTx ?? false;
   bool get isInRx => status?.isInRx ?? false;
@@ -33,11 +47,25 @@ class RadioController extends ChangeNotifier {
   bool get isGpsLocked => status?.isGpsLocked ?? false;
   bool get supportsVfo => deviceInfo?.supportsVfo ?? false;
 
-  RadioController({this.connection}) {
-    if (connection != null) {
-      _btStreamSubscription = connection!.input!.listen(_onDataReceived);
-      _initializeRadioState();
-    }
+  bool isAudioMonitoring = false;
+  bool isVfoScanning = false;
+  double _vfoScanStartFreq = 0.0;
+  double _vfoScanEndFreq = 0.0;
+  int _vfoScanStepKhz = 25;
+  double currentVfoFrequencyMhz = 0.0;
+  Timer? _vfoScanTimer;
+
+  RadioController({required this.device});
+
+  Future<void> connect() async {
+    if (_commandConnection?.isConnected ?? false) return;
+    _commandConnection = await BluetoothConnection.toAddress(device.address);
+    _btStreamSubscription = _commandConnection!.input!.listen(_onDataReceived);
+
+    _initializeRadioState();
+
+    _audioController = AudioController(deviceAddress: device.address, rfcommChannel: 4);
+    notifyListeners();
   }
 
   void _onDataReceived(Uint8List data) {
@@ -68,34 +96,64 @@ class RadioController extends ChangeNotifier {
     }
   }
 
-  void _handleEvent(EventNotificationBody eventBody) {
+  void _handleEvent(EventNotificationBody eventBody) async {
     bool dataChanged = false;
     switch (eventBody.eventType) {
       case EventType.HT_STATUS_CHANGED:
         final statusReply = eventBody.event as GetHtStatusReplyBody;
         if (statusReply.status != null) {
-          final oldChannelId = status?.currentChannelId ?? -1;
           status = statusReply.status;
-          if (status!.currentChannelId != oldChannelId) {
-             getChannel(status!.currentChannelId);
-          }
           dataChanged = true;
         }
         break;
       case EventType.HT_SETTINGS_CHANGED:
         final settingsReply = eventBody.event as ReadSettingsReplyBody;
         if (settingsReply.settings != null) {
-           settings = settingsReply.settings;
-           dataChanged = true;
+          settings = settingsReply.settings;
+          await _updateVfoChannels();
+          dataChanged = true;
         }
         break;
       case EventType.HT_CH_CHANGED:
         final channelReply = eventBody.event as ReadRFChReplyBody;
         if (channelReply.rfCh != null) {
-           currentChannel = channelReply.rfCh;
-           dataChanged = true;
+            final updatedChannel = channelReply.rfCh!;
+            if (status?.currentChannelId == updatedChannel.channelId) {
+                currentChannel = updatedChannel;
+            }
+            if (updatedChannel.channelId == settings?.channelA) {
+              channelA = updatedChannel;
+            }
+            if (updatedChannel.channelId == settings?.channelB) {
+              channelB = updatedChannel;
+            }
+            dataChanged = true;
         }
         break;
+      // --- ADD THIS CASE ---
+      case EventType.DATA_RXD:
+        final aprsBody = eventBody.event as DataRxdEventBody;
+        final packet = aprsBody.tncDataFragment;
+
+        // Add the new packet to the list
+        aprsPackets.add(packet);
+
+        // Optional: To prevent the list from growing forever, keep only the last 50 packets.
+        if (aprsPackets.length > 50) {
+          aprsPackets.removeAt(0);
+        }
+
+        if (kDebugMode) {
+          // You can use utf8.decode for APRS text, but be careful as some data is binary.
+          try {
+             print("APRS/BSS Data Received: ${utf8.decode(packet.data)}");
+          } catch (_) {
+             print("APRS/BSS Binary Data Received: ${packet.data}");
+          }
+        }
+        dataChanged = true;
+        break;
+      // ---------------------
       default:
         if (kDebugMode) print("Unhandled Event: ${eventBody.eventType}");
     }
@@ -117,18 +175,41 @@ class RadioController extends ChangeNotifier {
         getPosition(),
       ]);
 
-      deviceInfo = results[0] as DeviceInfo;
-      status = results[1] as StatusExt;
-      settings = results[2] as Settings;
-      batteryLevelAsPercentage = (results[3] as num).toInt();
-      batteryVoltage = (results[4] as num).toDouble();
+      deviceInfo = results[0] as DeviceInfo?;
+      status = results[1] as StatusExt?;
+      settings = results[2] as Settings?;
+      batteryLevelAsPercentage = (results[3] as num?)?.toInt();
+      batteryVoltage = (results[4] as num?)?.toDouble();
       gps = results[5] as Position?;
 
       if (status != null) {
         currentChannel = await getChannel(status!.currentChannelId);
       }
+
+      if (settings != null) {
+        await _updateVfoChannels();
+      }
+
     } catch (e) {
       if (kDebugMode) print('Error initializing radio state: $e');
+    } finally {
+      notifyListeners();
+    }
+  }
+
+  Future<void> _updateVfoChannels() async {
+    if (settings == null) return;
+    try {
+      final results = await Future.wait([
+        getChannel(settings!.channelA),
+        getChannel(settings!.channelB),
+      ]);
+      channelA = results[0];
+      channelB = results[1];
+    } catch (e) {
+      if (kDebugMode) print("Error updating VFO channels: $e");
+      channelA = null;
+      channelB = null;
     } finally {
       notifyListeners();
     }
@@ -137,14 +218,14 @@ class RadioController extends ChangeNotifier {
   GaiaParseResult? _parseGaiaFrameFromBuffer() {
     int frameStart = _rxBuffer.indexOf(GaiaFrame.startByte);
     if (frameStart == -1) {
-       _rxBuffer = Uint8List(0);
-       return null;
+      _rxBuffer = Uint8List(0);
+      return null;
     }
     if (frameStart > 0) _rxBuffer = _rxBuffer.sublist(frameStart);
     if (_rxBuffer.length < 4) return null;
     if (_rxBuffer[1] != GaiaFrame.version) {
-       _rxBuffer = _rxBuffer.sublist(1);
-       return _parseGaiaFrameFromBuffer();
+      _rxBuffer = _rxBuffer.sublist(1);
+      return _parseGaiaFrameFromBuffer();
     }
     final messagePayloadLength = _rxBuffer[3];
     final fullMessageLength = messagePayloadLength + 4;
@@ -165,14 +246,14 @@ class RadioController extends ChangeNotifier {
     if (kDebugMode) {
       print("RAW TX: $bytes");
     }
-    connection?.output.add(bytes);
-    await connection?.output.allSent;
+    _commandConnection?.output.add(bytes);
+    await _commandConnection?.output.allSent;
   }
 
-  // UPDATED to be more generic and reliable
   Future<T> _sendCommandExpectReply<T extends ReplyBody>({
     required Message command,
     required BasicCommand replyCommand,
+    bool Function(T body)? validator,
     Duration timeout = const Duration(seconds: 10),
   }) async {
     final completer = Completer<T>();
@@ -180,8 +261,13 @@ class RadioController extends ChangeNotifier {
 
     streamSub = _messageStreamController.stream.listen((message) {
       if (message.command == replyCommand && message.isReply) {
+        final body = message.body as T;
+
+        if (validator != null && !validator(body)) {
+          return;
+        }
+
         if (!completer.isCompleted) {
-          final body = message.body as T;
           if (body.replyStatus != ReplyStatus.SUCCESS) {
             completer.completeError(Exception("Command failed with status: ${body.replyStatus}"));
           } else {
@@ -206,42 +292,93 @@ class RadioController extends ChangeNotifier {
 
 
   Future<void> _registerForEvents() async {
-    final eventsToRegister = [EventType.HT_STATUS_CHANGED, EventType.HT_SETTINGS_CHANGED, EventType.HT_CH_CHANGED];
+    final eventsToRegister = [
+      EventType.HT_STATUS_CHANGED,
+      EventType.HT_SETTINGS_CHANGED,
+      EventType.HT_CH_CHANGED,
+      // --- ADD THIS ---
+      EventType.DATA_RXD,
+      // ---------------
+    ];
     for (var eventType in eventsToRegister) {
-       final command = Message(
-         commandGroup: CommandGroup.BASIC,
-         command: BasicCommand.REGISTER_NOTIFICATION,
-         isReply: false,
-         body: RegisterNotificationBody(eventType: eventType)
-       );
-       await _sendCommand(command);
-       await Future.delayed(const Duration(milliseconds: 50));
+      final command = Message(
+        commandGroup: CommandGroup.BASIC,
+        command: BasicCommand.REGISTER_NOTIFICATION,
+        isReply: false,
+        body: RegisterNotificationBody(eventType: eventType)
+      );
+      await _sendCommand(command);
+      await Future.delayed(const Duration(milliseconds: 50));
     }
   }
 
-  /// Get the VFO channel (usually channelId 0)
   Future<Channel> getVfoChannel() async {
-    // Most Benshi radios use channelId=0 for VFO.
     const vfoChannelId = 0;
     return await getChannel(vfoChannelId);
   }
 
-  /// Set VFO frequency by always operating on VFO channel (channelId 0)
-  Future<void> setVfoFrequency(double frequency) async {
-    const vfoChannelId = 0;
-    final vfoChannel = await getChannel(vfoChannelId);
+  Future<void> setVfoFrequency(double frequencyMhz) async {
+    final Channel vfoChannel;
+    try {
+      vfoChannel = await getChannel(0);
+    } catch (e) {
+      if (kDebugMode) print("Could not read VFO channel 0 to update it: $e");
+      return;
+    }
 
-    final newChannel = vfoChannel.copyWith(
-      rxFreq: frequency,
-      txFreq: frequency,
+    final updatedVfoChannel = vfoChannel.copyWith(
+      rxFreq: frequencyMhz,
+      txFreq: frequencyMhz,
     );
 
-    await writeChannel(newChannel);
-    currentChannel = newChannel;
+    await writeChannel(updatedVfoChannel);
+
+    currentChannel = updatedVfoChannel;
+    currentVfoFrequencyMhz = frequencyMhz;
     notifyListeners();
   }
 
-  // NEW: Writes a single channel's configuration to the radio.
+  Future<void> startVfoScan({required double startFreqMhz, required double endFreqMhz, required int stepKhz}) async {
+    if (isVfoScanning) return;
+
+    if (settings == null) await getSettings();
+    if (settings == null) return;
+    final newSettings = settings!.copyWith(vfoX: 1);
+    await writeSettings(newSettings);
+    await Future.delayed(const Duration(milliseconds: 100));
+
+    isVfoScanning = true;
+    _vfoScanStartFreq = startFreqMhz;
+    _vfoScanEndFreq = endFreqMhz;
+    _vfoScanStepKhz = stepKhz;
+    currentVfoFrequencyMhz = startFreqMhz;
+
+    await setVfoFrequency(currentVfoFrequencyMhz);
+
+    _vfoScanTimer?.cancel();
+    _vfoScanTimer = Timer.periodic(const Duration(milliseconds: 250), (timer) {
+      if (!isVfoScanning || (status?.isSq ?? false)) {
+        return;
+      }
+
+      currentVfoFrequencyMhz += (_vfoScanStepKhz / 1000.0);
+      if (currentVfoFrequencyMhz > _vfoScanEndFreq) {
+        currentVfoFrequencyMhz = _vfoScanStartFreq;
+      }
+
+      setVfoFrequency(currentVfoFrequencyMhz);
+    });
+
+    notifyListeners();
+  }
+
+  void stopVfoScan() {
+    isVfoScanning = false;
+    _vfoScanTimer?.cancel();
+    _vfoScanTimer = null;
+    notifyListeners();
+  }
+
   Future<void> writeChannel(Channel channel) async {
       final reply = await _sendCommandExpectReply<WriteRFChReplyBody>(
           command: Message(
@@ -251,67 +388,84 @@ class RadioController extends ChangeNotifier {
               body: WriteRFChBody(rfCh: channel)
           ),
           replyCommand: BasicCommand.WRITE_RF_CH,
-          timeout: const Duration(seconds: 3), // Writing can take a moment
+          timeout: const Duration(seconds: 3),
       );
-      // Error handling is now done in _sendCommandExpectReply
       if (kDebugMode) {
         print('Successfully wrote channel ${reply.channelId}');
       }
   }
 
-  Future<DeviceInfo> getDeviceInfo() async {
+  Future<void> writeSettings(Settings newSettings) async {
+    final reply = await _sendCommandExpectReply<WriteSettingsReplyBody>(
+      command: Message(
+        commandGroup: CommandGroup.BASIC,
+        command: BasicCommand.WRITE_SETTINGS,
+        isReply: false,
+        body: WriteSettingsBody(settings: newSettings),
+      ),
+      replyCommand: BasicCommand.WRITE_SETTINGS,
+    );
+
+    if (reply.replyStatus == ReplyStatus.SUCCESS) {
+      if (kDebugMode) print("Successfully sent WRITE_SETTINGS.");
+      settings = newSettings;
+      await _updateVfoChannels();
+      await getStatus();
+      notifyListeners();
+    } else {
+      throw Exception("Failed to set scan mode via WRITE_SETTINGS.");
+    }
+  }
+
+
+  Future<DeviceInfo?> getDeviceInfo() async {
     final reply = await _sendCommandExpectReply<GetDevInfoReplyBody>(
       command: Message(commandGroup: CommandGroup.BASIC, command: BasicCommand.GET_DEV_INFO, isReply: false, body: GetDevInfoBody()),
       replyCommand: BasicCommand.GET_DEV_INFO,
     );
-    if (reply.devInfo == null) throw Exception('Failed to get device info.');
     deviceInfo = reply.devInfo;
     notifyListeners();
-    return reply.devInfo!;
+    return reply.devInfo;
   }
 
-  Future<Settings> getSettings() async {
+  Future<Settings?> getSettings() async {
     final reply = await _sendCommandExpectReply<ReadSettingsReplyBody>(
       command: Message(commandGroup: CommandGroup.BASIC, command: BasicCommand.READ_SETTINGS, isReply: false, body: ReadSettingsBody()),
       replyCommand: BasicCommand.READ_SETTINGS,
     );
-    if (reply.settings == null) throw Exception('Failed to get settings.');
     settings = reply.settings;
     notifyListeners();
-    return reply.settings!;
+    return reply.settings;
   }
 
-  Future<StatusExt> getStatus() async {
+  Future<StatusExt?> getStatus() async {
     final reply = await _sendCommandExpectReply<GetHtStatusReplyBody>(
       command: Message(commandGroup: CommandGroup.BASIC, command: BasicCommand.GET_HT_STATUS, isReply: false, body: GetHtStatusBody()),
       replyCommand: BasicCommand.GET_HT_STATUS,
     );
-    if (reply.status == null) throw Exception('Failed to get status');
     status = reply.status;
     notifyListeners();
-    return reply.status!;
+    return reply.status;
   }
 
-  Future<num> getBatteryVoltage() async {
+  Future<num?> getBatteryVoltage() async {
     final reply = await _sendCommandExpectReply<ReadPowerStatusReplyBody>(
       command: Message(commandGroup: CommandGroup.BASIC, command: BasicCommand.READ_STATUS, isReply: false, body: ReadPowerStatusBody(statusType: PowerStatusType.BATTERY_VOLTAGE)),
       replyCommand: BasicCommand.READ_STATUS,
     );
-    if (reply.value == null) throw Exception('Failed to get battery voltage.');
     batteryVoltage = reply.value?.toDouble();
     notifyListeners();
-    return reply.value!;
+    return reply.value;
   }
 
-  Future<num> getBatteryPercentage() async {
+  Future<num?> getBatteryPercentage() async {
     final reply = await _sendCommandExpectReply<ReadPowerStatusReplyBody>(
       command: Message(commandGroup: CommandGroup.BASIC, command: BasicCommand.READ_STATUS, isReply: false, body: ReadPowerStatusBody(statusType: PowerStatusType.BATTERY_LEVEL_AS_PERCENTAGE)),
       replyCommand: BasicCommand.READ_STATUS,
     );
-    if (reply.value == null) throw Exception('Failed to get battery percentage.');
-    batteryLevelAsPercentage = reply.value as int;
+    batteryLevelAsPercentage = reply.value?.toInt();
     notifyListeners();
-    return reply.value!;
+    return reply.value;
   }
 
   Future<Position?> getPosition() async {
@@ -333,11 +487,12 @@ class RadioController extends ChangeNotifier {
     final reply = await _sendCommandExpectReply<ReadRFChReplyBody>(
       command: Message(commandGroup: CommandGroup.BASIC, command: BasicCommand.READ_RF_CH, isReply: false, body: ReadRFChBody(channelId: channelId)),
       replyCommand: BasicCommand.READ_RF_CH,
+      validator: (body) => body.rfCh?.channelId == channelId,
     );
     if (reply.rfCh == null) throw Exception('Failed to get channel $channelId.');
     if (status?.currentChannelId == channelId) {
-       currentChannel = reply.rfCh;
-       notifyListeners();
+      currentChannel = reply.rfCh;
+      notifyListeners();
     }
     return reply.rfCh!;
   }
@@ -359,7 +514,6 @@ class RadioController extends ChangeNotifier {
     return channels;
   }
 
-  /// Scan API: sets VFO frequency in a loop for scanning
   Future<void> scanFrequencies(List<double> frequencies, {Duration dwell = const Duration(milliseconds: 250), bool stopOnCarrier = false}) async {
     for (final freq in frequencies) {
       if (stopOnCarrier && (isInRx || isInTx)) {
@@ -367,48 +521,47 @@ class RadioController extends ChangeNotifier {
       }
       await setVfoFrequency(freq);
       await Future.delayed(dwell);
-      // Force status update so that isInRx/isInTx is fresh for stopOnCarrier
       await getStatus();
     }
   }
 
-  /// Enables or disables the radio's built-in memory channel scanning by writing to the main Settings block.
   Future<void> setRadioScan(bool enable) async {
-    // 1. Ensure we have the latest settings from the radio.
     if (settings == null) await getSettings();
     if (settings == null) throw Exception("Could not load radio settings to modify them.");
 
-    // 2. Create a new settings object with the desired scan state.
     final newSettings = settings!.copyWith(scan: enable);
+    await writeSettings(newSettings);
+  }
 
-    // 3. Build and send the WRITE_SETTINGS command.
-    final reply = await _sendCommandExpectReply<WriteSettingsReplyBody>(
-      command: Message(
-        commandGroup: CommandGroup.BASIC,
-        command: BasicCommand.WRITE_SETTINGS,
-        isReply: false,
-        body: WriteSettingsBody(settings: newSettings),
-      ),
-      replyCommand: BasicCommand.WRITE_SETTINGS,
-    );
+  Future<void> startAudioMonitor() async {
+    if (_audioController == null) return;
+    await _audioController!.startMonitoring();
+    isAudioMonitoring = _audioController!.isMonitoring;
+    notifyListeners();
+  }
 
-    // 4. On success, update the local state and refresh radio status.
-    if (reply.replyStatus == ReplyStatus.SUCCESS) {
-      if (kDebugMode) {
-        print("Successfully sent WRITE_SETTINGS with scan: $enable");
-      }
-      settings = newSettings; // Update local copy of settings
-      await getStatus(); // Refresh status to get the radio's `isScan` state
-      notifyListeners(); // Notify UI to rebuild
+  Future<void> stopAudioMonitor() async {
+    if (_audioController == null) return;
+    await _audioController!.stopMonitoring();
+    isAudioMonitoring = _audioController!.isMonitoring;
+    notifyListeners();
+  }
+
+  Future<void> toggleAudioMonitor() async {
+    if (isAudioMonitoring) {
+      await stopAudioMonitor();
     } else {
-      throw Exception("Failed to set scan mode via WRITE_SETTINGS.");
+      await startAudioMonitor();
     }
   }
 
   @override
   void dispose() {
+    stopVfoScan();
     _btStreamSubscription?.cancel();
+    _commandConnection?.close();
     _messageStreamController.close();
+    _audioController?.dispose();
     super.dispose();
   }
 }
